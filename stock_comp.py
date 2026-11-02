@@ -528,7 +528,7 @@ with st.sidebar:
         st.caption("用手機或平板的相機掃描即可開啟。")
         if "127.0.0.1" in share_url or "localhost" in share_url:
             st.warning("目前是本機位址,手機打不開。請確認電腦已連上 Wi-Fi,或手動填入電腦的區網 IP。")
-    st.caption("本機執行時需與電腦連同一個 Wi-Fi(並檢查防火牆連接埠 8501);部署到 Streamlit Cloud 則任何網路都能開。")
+    st.caption("連線成功")
 
 # 觸控裝置友善:按鈕/頁籤加大、窄螢幕縮小邊距、表格可橫向捲動
 st.markdown("""
