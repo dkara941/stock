@@ -71,6 +71,65 @@ def make_driver():
     return webdriver.Chrome(options=opts)
 
 
+def _click_first(driver, xpath: str) -> bool:
+    """點第一個可見的符合元素;點得到回傳 True。"""
+    try:
+        for el in driver.find_elements(By.XPATH, xpath):
+            if el.is_displayed() and el.is_enabled():
+                driver.execute_script("arguments[0].click();", el)
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def _collect_pages(driver) -> list:
+    """回傳持股頁面的所有 page_source:先嘗試展開「全部」,再逐頁按「下一頁」。"""
+    # 1) 若頁面有「全部 / 顯示全部 / 更多」按鈕或下拉選項,先展開
+    for kw in ("顯示全部", "全部", "更多"):
+        if _click_first(driver, f"//a[contains(normalize-space(.),'{kw}')]"
+                                f"|//button[contains(normalize-space(.),'{kw}')]"
+                                f"|//select/option[contains(normalize-space(.),'{kw}')]"):
+            time.sleep(1.5)
+            break
+    pages = [driver.page_source]
+    # 2) 若有分頁,逐頁往下翻(最多 40 頁),直到沒有「下一頁」或內容不再變化
+    for _ in range(40):
+        if not _click_first(driver, "//a[contains(normalize-space(.),'下一頁')]"
+                                    "|//button[contains(normalize-space(.),'下一頁')]"
+                                    "|//a[normalize-space(.)='>']|//a[normalize-space(.)='›']"):
+            break
+        time.sleep(1.2)
+        src = driver.page_source
+        if src == pages[-1]:
+            break
+        pages.append(src)
+    return pages
+
+
+def _parse_holdings(tables: list) -> pd.DataFrame:
+    """從 read_html 的所有表格中,挑出含「名稱」「比例」欄位的表,全部合併(不只取第一張)。"""
+    parts = []
+    for df in tables:
+        cols = [str(c) for c in df.columns]
+        w_col = next((c for c in cols if "比例" in c), None)
+        n_col = next((c for c in cols if "名稱" in c), None)
+        if not (w_col and n_col):
+            continue
+        df = df.copy()
+        df.columns = cols
+        for _, r in df.iterrows():
+            m = re.search(r"\((\w+)\.TW", str(r[n_col]))  # .TW 與 .TWO(上櫃)都會匹配
+            if not m:
+                continue
+            parts.append({
+                "代號": m.group(1),
+                "名稱": re.sub(r"\(.*\)", "", str(r[n_col])).strip(),
+                "權重(%)": pd.to_numeric(r[w_col], errors="coerce"),
+            })
+    return pd.DataFrame(parts)
+
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_holdings(etf: str) -> pd.DataFrame:
     driver = make_driver()
@@ -81,30 +140,22 @@ def fetch_holdings(etf: str) -> pd.DataFrame:
             EC.presence_of_element_located((By.TAG_NAME, "table"))
         )
         time.sleep(1.5)  # 等動態內容載入
-        tables = pd.read_html(StringIO(driver.page_source))
+        pages = _collect_pages(driver)  # 展開全部 + 翻頁,確保抓到「全部」持股
     finally:
         driver.quit()
 
-    # 找出含「比例」欄位的表格(頁面結構改版時,這裡是最可能要調整的地方)
-    for df in tables:
-        cols = [str(c) for c in df.columns]
-        w_col = next((c for c in cols if "比例" in c), None)
-        n_col = next((c for c in cols if "名稱" in c), None)
-        if w_col and n_col:
-            df.columns = cols
-            rows = []
-            for _, r in df.iterrows():
-                m = re.search(r"\((\w+)\.TW", str(r[n_col]))  # .TW 與 .TWO(上櫃)都會匹配
-                if not m:
-                    continue
-                rows.append({
-                    "代號": m.group(1),
-                    "名稱": re.sub(r"\(.*\)", "", str(r[n_col])).strip(),
-                    "權重(%)": pd.to_numeric(r[w_col], errors="coerce"),
-                })
-            out = pd.DataFrame(rows).dropna()
-            return out.sort_values("權重(%)", ascending=False).reset_index(drop=True)
-    return pd.DataFrame()
+    tables = []
+    for src in pages:
+        try:
+            tables += pd.read_html(StringIO(src))
+        except ValueError:
+            pass
+    out = _parse_holdings(tables).dropna()
+    if out.empty:
+        return pd.DataFrame()
+    # 同一檔可能因翻頁/展開而重複出現,以代號去重
+    out = out.drop_duplicates("代號")
+    return out.sort_values("權重(%)", ascending=False).reset_index(drop=True)
 
 
 @st.cache_data(ttl=86400, show_spinner=False)
@@ -586,8 +637,15 @@ if is_etf:
     st.subheader(f"{code} 成分股(共 {len(holdings)} 檔台股)")
     st.caption("前五大:" + "、".join(
         f"{r['名稱']} ({r['代號']}):{r['權重(%)']:.2f}%"
-        for _, r in holdings.head(5).iterrows()))
-    st.dataframe(holdings, use_container_width=True, hide_index=True)
+        for _, r in holdings.head(5).iterrows())
+        + f"｜台股權重合計 {holdings['權重(%)'].sum():.2f}%(其餘可能為現金、期貨或海外標的)")
+    show = holdings.assign(排名=range(1, len(holdings) + 1))[["排名", "代號", "名稱", "權重(%)"]]
+    st.dataframe(
+        show, use_container_width=True, hide_index=True,
+        height=min(38 + 35 * len(show), 2000),  # 依筆數撐高,不用捲動就能看到全部
+        column_config={"權重(%)": st.column_config.ProgressColumn(
+            "權重(%)", format="%.2f%%", min_value=0.0,
+            max_value=float(holdings["權重(%)"].max()))})
 else:
     # 個股:成分股就是它自己,權重 100%
     name_map = fetch_name_map()
@@ -602,7 +660,10 @@ else:
 c1, c2, c3 = st.columns([1, 2, 1])
 picked = c1.date_input("選擇日期", value=date.today(), max_value=date.today())
 views = c2.multiselect("選擇要看的面向(可複選)", ASPECTS, default=[])
-top_n = c3.slider("前 N 大持股", 3, 30, 10) if is_etf else 1
+if is_etf and len(holdings) > 3:
+    top_n = c3.slider("分析前 N 大持股(越多越慢)", 3, len(holdings), min(10, len(holdings)))
+else:
+    top_n = len(holdings)
 
 if not views:
     st.info("請在上方選擇要看的面向:成交量、技術面、籌碼面。")
