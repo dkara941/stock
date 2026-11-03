@@ -9,7 +9,7 @@
 需要:  本機已安裝 Chrome(Selenium 4 會自動管理 chromedriver)
 
 資料來源:
-  成分股權重  MoneyDJ ETF 持股頁(Selenium 抓取,各投信的 ETF 都適用)
+  成分股權重  元大投信 ETF 持股比重頁(Selenium 抓取,僅適用元大發行的 ETF,如 0050、0056)
   成交量/價格 證交所 STOCK_DAY(上市)、櫃買中心 tradingStock(上櫃)
   籌碼面      證交所 T86(上市)、櫃買中心 insti/dailyTrade(上櫃)三大法人買賣超
   股票名稱    證交所 / 櫃買中心 OpenAPI 公司基本資料
@@ -45,7 +45,7 @@ if not _st_running():
     sys.exit(0)
 
 HEADERS = {"User-Agent": "Mozilla/5.0"}
-MONEYDJ = "https://www.moneydj.com/etf/x/basic/basic0007b.xdjhtm?etfid={code}.tw"
+YUANTA = "https://www.yuantaetfs.com/product/detail/{code}/ratio"
 
 
 # ---------------------------------------------------------------- 1. 成分股
@@ -83,77 +83,86 @@ def _click_first(driver, xpath: str) -> bool:
     return False
 
 
-def _collect_pages(driver) -> list:
-    """回傳持股頁面的所有 page_source:先嘗試展開「全部」,再逐頁按「下一頁」。"""
-    # 1) 若頁面有「全部 / 顯示全部 / 更多」按鈕或下拉選項,先展開
-    for kw in ("顯示全部", "全部", "更多"):
-        if _click_first(driver, f"//a[contains(normalize-space(.),'{kw}')]"
-                                f"|//button[contains(normalize-space(.),'{kw}')]"
-                                f"|//select/option[contains(normalize-space(.),'{kw}')]"):
-            time.sleep(1.5)
-            break
-    pages = [driver.page_source]
-    # 2) 若有分頁,逐頁往下翻(最多 40 頁),直到沒有「下一頁」或內容不再變化
-    for _ in range(40):
-        if not _click_first(driver, "//a[contains(normalize-space(.),'下一頁')]"
-                                    "|//button[contains(normalize-space(.),'下一頁')]"
-                                    "|//a[normalize-space(.)='>']|//a[normalize-space(.)='›']"):
-            break
-        time.sleep(1.2)
-        src = driver.page_source
-        if src == pages[-1]:
-            break
-        pages.append(src)
-    return pages
+_CODE = re.compile(r"[0-9]{4,6}[A-Z]?")
+_NUM = re.compile(r"-?[\d,]+(?:\.\d+)?")
+_LABEL = re.compile(r"^(商品代碼|商品名稱|商品數量|商品權重)\s*")
 
 
-def _parse_holdings(tables: list) -> pd.DataFrame:
-    """從 read_html 的所有表格中,挑出含「名稱」「比例」欄位的表,全部合併(不只取第一張)。"""
-    parts = []
+def _parse_yuanta_text(text: str) -> pd.DataFrame:
+    """從頁面文字取出「基金權重-股票」區塊,每 4 行 = 代碼 / 名稱 / 數量 / 權重。"""
+    if "基金權重-股票" in text:
+        text = text.split("基金權重-股票", 1)[1]
+    text = text.split("基金權重-期貨", 1)[0]  # 期貨區塊不要
+    lines = [_LABEL.sub("", ln).strip() for ln in text.splitlines()]
+    lines = [ln for ln in lines if ln]
+    rows, i = [], 0
+    while i + 3 < len(lines):
+        code, name, qty, w = lines[i:i + 4]
+        if _CODE.fullmatch(code) and _NUM.fullmatch(qty) and _NUM.fullmatch(w):
+            rows.append({"代號": code, "名稱": name,
+                         "權重(%)": float(w.replace(",", ""))})
+            i += 4
+        else:
+            i += 1
+    return pd.DataFrame(rows)
+
+
+def _parse_yuanta_tables(html: str) -> pd.DataFrame:
+    """若頁面是真正的 <table>,優先用欄位名稱解析(商品代碼 / 商品名稱 / 商品權重)。"""
+    try:
+        tables = pd.read_html(StringIO(html))
+    except ValueError:
+        return pd.DataFrame()
     for df in tables:
         cols = [str(c) for c in df.columns]
-        w_col = next((c for c in cols if "比例" in c), None)
-        n_col = next((c for c in cols if "名稱" in c), None)
-        if not (w_col and n_col):
-            continue
-        df = df.copy()
-        df.columns = cols
-        for _, r in df.iterrows():
-            m = re.search(r"\((\w+)\.TW", str(r[n_col]))  # .TW 與 .TWO(上櫃)都會匹配
-            if not m:
-                continue
-            parts.append({
-                "代號": m.group(1),
-                "名稱": re.sub(r"\(.*\)", "", str(r[n_col])).strip(),
-                "權重(%)": pd.to_numeric(r[w_col], errors="coerce"),
-            })
-    return pd.DataFrame(parts)
+        c_code = next((c for c in cols if "商品代碼" in c), None)
+        c_name = next((c for c in cols if "商品名稱" in c), None)
+        c_w = next((c for c in cols if "商品權重" in c), None)
+        if not (c_code and c_name and c_w) or any("商品年月" in c for c in cols):
+            continue  # 沒有必要欄位,或是期貨表(有商品年月)
+        out = pd.DataFrame({
+            "代號": df[c_code].astype(str).str.strip(),
+            "名稱": df[c_name].astype(str).str.strip(),
+            "權重(%)": pd.to_numeric(df[c_w], errors="coerce"),
+        })
+        out = out[out["代號"].map(lambda x: bool(_CODE.fullmatch(x)))].dropna()
+        if not out.empty:
+            return out
+    return pd.DataFrame()
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_holdings(etf: str) -> pd.DataFrame:
+    """元大投信官網「持股比重」頁:股票預設只顯示前 5 檔,需按「展開」才會列出全部。"""
     driver = make_driver()
     try:
         # finally 裡的程式不管有沒有出錯都會執行,確保 Chrome 一定被關掉,不會留下殭屍程序。
-        driver.get(MONEYDJ.format(code=etf))
-        WebDriverWait(driver, 20).until(
-            EC.presence_of_element_located((By.TAG_NAME, "table"))
-        )
-        time.sleep(1.5)  # 等動態內容載入
-        pages = _collect_pages(driver)  # 展開全部 + 翻頁,確保抓到「全部」持股
+        driver.get(YUANTA.format(code=etf))
+        WebDriverWait(driver, 25).until(
+            lambda d: "商品權重" in d.find_element(By.TAG_NAME, "body").text)
+        time.sleep(1.0)  # 等動態內容載入
+        body = lambda: driver.find_element(By.TAG_NAME, "body").text
+
+        # 反覆按「展開」直到筆數不再增加(最多 10 次)
+        prev = len(_parse_yuanta_text(body()))
+        for _ in range(10):
+            if not _click_first(driver, "//*[self::button or self::a or self::div or self::span]"
+                                        "[normalize-space(text())='展開']"):
+                break
+            time.sleep(1.2)
+            cur = len(_parse_yuanta_text(body()))
+            if cur <= prev:
+                break
+            prev = cur
+
+        out = _parse_yuanta_tables(driver.page_source)
+        if out.empty:
+            out = _parse_yuanta_text(body())
     finally:
         driver.quit()
 
-    tables = []
-    for src in pages:
-        try:
-            tables += pd.read_html(StringIO(src))
-        except ValueError:
-            pass
-    out = _parse_holdings(tables).dropna()
     if out.empty:
         return pd.DataFrame()
-    # 同一檔可能因翻頁/展開而重複出現,以代號去重
     out = out.drop_duplicates("代號")
     return out.sort_values("權重(%)", ascending=False).reset_index(drop=True)
 
@@ -625,14 +634,15 @@ if len(codes) > 1:
 # 00 開頭視為 ETF,其餘視為個股
 is_etf = code.startswith("00")
 if is_etf:
-    with st.spinner(f"Selenium 抓取 {code} 成分股…"):
+    with st.spinner(f"Selenium 從元大投信抓取 {code} 成分股…"):
         try:
             holdings = fetch_holdings(code)
         except Exception as e:
             holdings = pd.DataFrame()
             st.error(f"抓取失敗:{e}")
     if holdings.empty:
-        st.error("找不到成分股。請確認代碼,或來源頁面結構已改版,需調整 fetch_holdings。")
+        st.error("找不到成分股。此來源只支援元大投信發行的 ETF(如 0050、0056),"
+             "其他投信的 ETF 請改用其他來源;若確定是元大 ETF,可能是頁面結構改版,需調整 fetch_holdings。")
         st.stop()
     st.subheader(f"{code} 成分股(共 {len(holdings)} 檔台股)")
     st.caption("前五大:" + "、".join(
@@ -718,4 +728,4 @@ for tab, v in zip(tabs, views):
             else:
                 st.line_chart(d["close"])
 
-st.caption("僅供研究參考,不構成投資建議。資料以證交所、櫃買中心與 MoneyDJ 公開資訊為準。")
+st.caption("僅供研究參考,不構成投資建議。資料以證交所、櫃買中心與元大投信公開資訊為準。")
