@@ -9,7 +9,7 @@
 需要:  本機已安裝 Chrome(Selenium 4 會自動管理 chromedriver)
 
 資料來源:
-  成分股權重  元大投信 ETF 持股比重頁(Selenium 抓取,僅適用元大發行的 ETF,如 0050、0056)
+  成分股權重  口袋證券 ETF 持股明細頁(Selenium 抓取,各投信 ETF 含主動式 ETF 皆適用)
   成交量/價格 證交所 STOCK_DAY(上市)、櫃買中心 tradingStock(上櫃)
   籌碼面      證交所 T86(上市)、櫃買中心 insti/dailyTrade(上櫃)三大法人買賣超
   股票名稱    證交所 / 櫃買中心 OpenAPI 公司基本資料
@@ -46,7 +46,7 @@ if not _st_running():
     sys.exit(0)
 
 HEADERS = {"User-Agent": "Mozilla/5.0"}
-YUANTA = "https://www.yuantaetfs.com/product/detail/{code}/ratio"
+POCKET = "https://www.pocket.tw/etf/tw/{code}/fundholding/"  # 口袋證券 ETF 持股明細
 
 
 # ---------------------------------------------------------------- 1. 成分股
@@ -653,15 +653,15 @@ if len(codes) > 1:
 # 00 開頭視為 ETF,其餘視為個股
 is_etf = code.startswith("00")
 if is_etf:
-    with st.spinner(f"Selenium 從元大投信抓取 {code} 成分股…"):
+    with st.spinner(f"Selenium 從口袋證券抓取 {code} 成分股…"):
         try:
             holdings = fetch_holdings(code)
         except Exception as e:
             holdings = pd.DataFrame()
             st.error(f"抓取失敗:{e}")
     if holdings.empty:
-        st.error("找不到成分股。此來源只支援元大投信發行的 ETF(如 0050、0056),"
-             "其他投信的 ETF 請改用其他來源;若確定是元大 ETF,可能是頁面結構改版,需調整 fetch_holdings。")
+        st.error("找不到成分股。請確認 ETF 代號是否正確,"
+             "或口袋證券頁面結構已改版,需調整 fetch_holdings。")
         st.stop()
     st.subheader(f"{code} 成分股(共 {len(holdings)} 檔台股)")
     st.caption("前五大:" + "、".join(
@@ -747,4 +747,4 @@ for tab, v in zip(tabs, views):
             else:
                 st.line_chart(d["close"])
 
-st.caption("僅供研究參考,不構成投資建議。資料以證交所、櫃買中心與元大投信公開資訊為準。")
+st.caption("僅供研究參考,不構成投資建議。資料以證交所、櫃買中心與口袋證券公開資訊為準。")
