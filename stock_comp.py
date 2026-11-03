@@ -28,6 +28,7 @@ from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
+from selenium.common.exceptions import TimeoutException
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 
@@ -63,6 +64,7 @@ def make_driver():
     opts.add_argument("--disable-dev-shm-usage")  # 雲端 /dev/shm 很小,避免 Chrome 崩潰
     opts.add_argument("--disable-gpu")
     opts.add_argument("--window-size=1400,1000")
+    opts.set_capability("goog:loggingPrefs", {"performance": "ALL"})  # 攔截頁面的 XHR/API 回應
     browser = shutil.which("chromium") or shutil.which("chromium-browser")
     driver_bin = shutil.which("chromedriver")
     if browser and driver_bin:
@@ -71,99 +73,244 @@ def make_driver():
     return webdriver.Chrome(options=opts)
 
 
+def _btn_xpath(*kws: str) -> str:
+    """找「看更多 / 載入更多 / 展開 / 下一頁」這類短文字按鈕(排除會跳到別頁的一般連結)。"""
+    parts = []
+    for kw in kws:
+        short = f"string-length(normalize-space(.))<=8 and contains(normalize-space(.),'{kw}')"
+        parts.append(f"//button[{short}]")
+        parts.append(f"//a[{short}][not(@href) or starts-with(@href,'#') or starts-with(@href,'javascript')]")
+        parts.append(f"//*[self::div or self::span or self::li or self::p]"
+                     f"[not(*)][{short}]")  # [not(*)] = 最內層文字節點,避免點到整個容器
+    return "|".join(parts)
+
+
 def _click_first(driver, xpath: str) -> bool:
-    """點第一個可見的符合元素;點得到回傳 True。"""
+    """點第一個可見的符合元素;若點完跳到別頁就退回並回傳 False。"""
+    url0 = driver.current_url.split("#")[0]
     try:
         for el in driver.find_elements(By.XPATH, xpath):
-            if el.is_displayed() and el.is_enabled():
-                driver.execute_script("arguments[0].click();", el)
+            if el.is_displayed():
+                driver.execute_script("arguments[0].scrollIntoView({block:'center'});"
+                                      "arguments[0].click();", el)
+                time.sleep(0.5)
+                if driver.current_url.split("#")[0] != url0:
+                    driver.back()
+                    time.sleep(1.5)
+                    return False
                 return True
     except Exception:
         pass
     return False
 
 
-_CODE = re.compile(r"[0-9]{4,6}[A-Z]?")
-_NUM = re.compile(r"-?[\d,]+(?:\.\d+)?")
-_LABEL = re.compile(r"^(商品代碼|商品名稱|商品數量|商品權重)\s*")
+def _row_count(driver) -> int:
+    try:
+        return len(driver.find_elements(By.CSS_SELECTOR, "table tbody tr"))
+    except Exception:
+        return 0
 
 
-def _parse_yuanta_text(text: str) -> pd.DataFrame:
-    """從頁面文字取出「基金權重-股票」區塊,每 4 行 = 代碼 / 名稱 / 數量 / 權重。"""
-    if "基金權重-股票" in text:
-        text = text.split("基金權重-股票", 1)[1]
-    text = text.split("基金權重-期貨", 1)[0]  # 期貨區塊不要
-    lines = [_LABEL.sub("", ln).strip() for ln in text.splitlines()]
-    lines = [ln for ln in lines if ln]
-    rows, i = [], 0
-    while i + 3 < len(lines):
-        code, name, qty, w = lines[i:i + 4]
-        if _CODE.fullmatch(code) and _NUM.fullmatch(qty) and _NUM.fullmatch(w):
-            rows.append({"代號": code, "名稱": name,
-                         "權重(%)": float(w.replace(",", ""))})
-            i += 4
-        else:
-            i += 1
+def _expand_page(driver) -> list:
+    """把持股頁「撐到最完整」:反覆捲到底(lazy load / 無限捲動)、連點「看更多」、翻「下一頁」。
+    回傳過程中每個狀態的 page_source(分頁時每頁各一份)。"""
+    def scroll_until_stable():
+        same = 0
+        last = -1
+        for _ in range(40):
+            driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+            time.sleep(0.8)
+            n = _row_count(driver)
+            same = same + 1 if n == last else 0
+            last = n
+            if same >= 2:
+                break
+
+    scroll_until_stable()
+    for _ in range(40):  # 「看更多」類按鈕:點到列數不再增加為止
+        before = _row_count(driver), len(driver.page_source)
+        if not _click_first(driver, _btn_xpath("看更多", "載入更多", "顯示更多", "顯示全部", "展開", "更多")):
+            break
+        time.sleep(1)
+        scroll_until_stable()
+        if (_row_count(driver), len(driver.page_source)) == before:
+            break
+    pages = [driver.page_source]
+    for _ in range(40):  # 分頁:最多 40 頁
+        if not _click_first(driver, _btn_xpath("下一頁")):
+            break
+        time.sleep(1.2)
+        scroll_until_stable()
+        src = driver.page_source
+        if src == pages[-1]:
+            break
+        pages.append(src)
+    return pages
+
+
+def _to_float(x):
+    return pd.to_numeric(re.sub(r"[^\d.\-]", "", str(x)), errors="coerce")
+
+
+def _parse_tables(tables: list) -> pd.DataFrame:
+    """從 read_html 的所有表格挑出含「權重/比例」與「名稱」的表,全部合併(不只取第一張)。"""
+    rows = []
+    for df in tables:
+        cols = [" ".join(map(str, c)) if isinstance(c, tuple) else str(c) for c in df.columns]
+        w_col = next((c for c in cols if any(k in c for k in ("權重", "比例", "占比", "佔比"))), None)
+        c_col = next((c for c in cols if "代號" in c or "代碼" in c), None)
+        n_col = next((c for c in cols if c not in (w_col, c_col)
+                      and any(k in c for k in ("名稱", "股票", "標的"))), None)
+        if not w_col or not (c_col or n_col):
+            continue
+        df = df.copy()
+        df.columns = cols
+        for _, r in df.iterrows():
+            name_cell = str(r[n_col]) if n_col else ""
+            if c_col:
+                code = str(r[c_col]).strip().upper()
+            else:  # 代號夾在名稱裡:'台積電(2330)' 或 '2330 台積電'
+                m = re.search(r"(?<![\dA-Za-z])(\d{4,6}[A-Z]?)(?![\dA-Za-z])", name_cell)
+                code = m.group(1) if m else ""
+            if not CODE_RE.match(code):
+                continue  # 現金、期貨、應付款等非股票列
+            name = re.sub(r"[\(\(]?\b" + re.escape(code) + r"\b[\)\)]?(\.TWO?)?", "", name_cell).strip()
+            rows.append({"代號": code, "名稱": name or code, "權重(%)": _to_float(r[w_col])})
     return pd.DataFrame(rows)
 
 
-def _parse_yuanta_tables(html: str) -> pd.DataFrame:
-    """若頁面是真正的 <table>,優先用欄位名稱解析(商品代碼 / 商品名稱 / 商品權重)。"""
+def _parse_text(text: str) -> pd.DataFrame:
+    """備援:表格解析不到時,直接從頁面文字找「代號 名稱 xx.xx%」的序列。"""
+    tok = text.split()
+    rows = []
+    for i, t in enumerate(tok):
+        if not CODE_RE.match(t) or i + 2 >= len(tok):
+            continue
+        name = tok[i + 1]
+        if not re.search(r"[A-Za-z\u4e00-\u9fff]", name):
+            continue
+        w = next((x for x in tok[i + 2:i + 6] if re.fullmatch(r"\d+(\.\d+)?%", x)), None)
+        if w:
+            rows.append({"代號": t, "名稱": name, "權重(%)": _to_float(w)})
+    return pd.DataFrame(rows)
+
+
+_CODE_KEY = re.compile(r"code|id$|key|symbol|ticker|stock|comm|代號|代碼", re.I)
+_NAME_KEY = re.compile(r"name|名稱", re.I)
+_W_KEY = re.compile(r"weight|ratio|rate|percent|pct|proportion|權重|比例|占比|佔比", re.I)
+
+
+def _rows_from_dicts(items: list) -> list:
+    rows = []
+    for d in items:
+        if not isinstance(d, dict):
+            continue
+        code = next((str(v).strip().upper() for k, v in d.items()
+                     if _CODE_KEY.search(str(k)) and isinstance(v, (str, int))
+                     and CODE_RE.match(str(v).strip().upper())), None)
+        w = next((_to_float(v) for k, v in d.items()
+                  if _W_KEY.search(str(k)) and isinstance(v, (str, int, float))
+                  and pd.notna(_to_float(v))), None)
+        if not code or w is None:
+            continue
+        name = next((str(v).strip() for k, v in d.items()
+                     if _NAME_KEY.search(str(k)) and isinstance(v, str) and v.strip()), code)
+        rows.append({"代號": code, "名稱": name, "權重(%)": w})
+    return rows
+
+
+def _walk_json(obj, out: list):
+    """遞迴找出 JSON 裡「像持股清單」的 list(每筆有代號與權重)。"""
+    if isinstance(obj, list):
+        if len(obj) >= 3 and all(isinstance(x, dict) for x in obj[:3]):
+            rows = _rows_from_dicts(obj)
+            if len(rows) >= 3:
+                out.extend(rows)
+        for x in obj:
+            _walk_json(x, out)
+    elif isinstance(obj, dict):
+        for v in obj.values():
+            _walk_json(v, out)
+
+
+def _harvest_api(driver, bucket: dict):
+    """讀取瀏覽器 performance log,把頁面自己呼叫的 JSON API 回應撈出來,
+    依 API 路徑分組累積(同一支 API 分頁呼叫多次也會合併)。"""
+    import json
     try:
-        tables = pd.read_html(StringIO(html))
-    except ValueError:
-        return pd.DataFrame()
-    for df in tables:
-        cols = [str(c) for c in df.columns]
-        c_code = next((c for c in cols if "商品代碼" in c), None)
-        c_name = next((c for c in cols if "商品名稱" in c), None)
-        c_w = next((c for c in cols if "商品權重" in c), None)
-        if not (c_code and c_name and c_w) or any("商品年月" in c for c in cols):
-            continue  # 沒有必要欄位,或是期貨表(有商品年月)
-        out = pd.DataFrame({
-            "代號": df[c_code].astype(str).str.strip(),
-            "名稱": df[c_name].astype(str).str.strip(),
-            "權重(%)": pd.to_numeric(df[c_w], errors="coerce"),
-        })
-        out = out[out["代號"].map(lambda x: bool(_CODE.fullmatch(x)))].dropna()
-        if not out.empty:
-            return out
-    return pd.DataFrame()
+        logs = driver.get_log("performance")
+    except Exception:
+        return
+    for entry in logs:
+        try:
+            msg = json.loads(entry["message"])["message"]
+            if msg.get("method") != "Network.responseReceived":
+                continue
+            prm = msg["params"]
+            if prm.get("type") not in ("XHR", "Fetch"):
+                continue
+            url = prm["response"]["url"].split("?")[0]
+            body = driver.execute_cdp_cmd("Network.getResponseBody", {"requestId": prm["requestId"]})
+            text = body.get("body", "")
+            if not text or text[:1] not in "[{":
+                continue
+            found = []
+            _walk_json(json.loads(text), found)
+            if found:
+                bucket.setdefault(url, []).extend(found)
+        except Exception:
+            continue
+
+
+def _best_api_rows(bucket: dict) -> pd.DataFrame:
+    best = pd.DataFrame()
+    for rows in bucket.values():
+        df = pd.DataFrame(rows).drop_duplicates("代號")
+        if len(df) > len(best):
+            best = df
+    if not best.empty and 0.5 <= best["權重(%)"].sum() <= 1.5:  # 比例是 0~1 的小數 -> 換成 %
+        best = best.assign(**{"權重(%)": best["權重(%)"] * 100})
+    return best
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_holdings(etf: str) -> pd.DataFrame:
-    """元大投信官網「持股比重」頁:股票預設只顯示前 5 檔,需按「展開」才會列出全部。"""
+    """口袋證券「持股明細」頁(Nuxt 動態載入,requests 抓不到資料,必須用瀏覽器渲染)。
+    兩條路並行,取筆數較多者:(1) 攔截頁面呼叫的 JSON API(通常一次回傳全部持股,不受畫面分頁影響)
+    (2) 把頁面展開到最完整後解析 HTML 表格。"""
     driver = make_driver()
+    api_bucket: dict = {}
     try:
         # finally 裡的程式不管有沒有出錯都會執行,確保 Chrome 一定被關掉,不會留下殭屍程序。
-        driver.get(YUANTA.format(code=etf))
-        WebDriverWait(driver, 25).until(
-            lambda d: "商品權重" in d.find_element(By.TAG_NAME, "body").text)
-        time.sleep(1.0)  # 等動態內容載入
-        body = lambda: driver.find_element(By.TAG_NAME, "body").text
-
-        # 反覆按「展開」直到筆數不再增加(最多 10 次)
-        prev = len(_parse_yuanta_text(body()))
-        for _ in range(10):
-            if not _click_first(driver, "//*[self::button or self::a or self::div or self::span]"
-                                        "[normalize-space(text())='展開']"):
-                break
-            time.sleep(1.2)
-            cur = len(_parse_yuanta_text(body()))
-            if cur <= prev:
-                break
-            prev = cur
-
-        out = _parse_yuanta_tables(driver.page_source)
-        if out.empty:
-            out = _parse_yuanta_text(body())
+        driver.get(POCKET.format(code=etf))
+        try:
+            WebDriverWait(driver, 25).until(lambda d: _row_count(d) > 0)
+        except TimeoutException:
+            pass  # 可能不是 <table> 結構,交給後面的備援解析
+        time.sleep(1.5)
+        _harvest_api(driver, api_bucket)
+        pages = _expand_page(driver)
+        _harvest_api(driver, api_bucket)
+        body_text = driver.find_element(By.TAG_NAME, "body").text
     finally:
         driver.quit()
 
+    tables = []
+    for src in pages:
+        try:
+            tables += pd.read_html(StringIO(src))
+        except ValueError:
+            pass
+    cands = [
+        _parse_tables(tables).dropna().drop_duplicates("代號"),
+        _best_api_rows(api_bucket).dropna().drop_duplicates("代號"),
+    ]
+    out = max(cands, key=len)
     if out.empty:
-        return pd.DataFrame()
-    out = out.drop_duplicates("代號")
+        out = _parse_text(body_text).dropna().drop_duplicates("代號")
+    if out.empty:
+        snippet = re.sub(r"\s+", " ", body_text)[:400]
+        raise ValueError(f"口袋證券頁面解析不到持股(頁面開頭文字:{snippet})")
     return out.sort_values("權重(%)", ascending=False).reset_index(drop=True)
 
 
