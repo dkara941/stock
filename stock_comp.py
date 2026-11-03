@@ -9,7 +9,7 @@
 需要:  本機已安裝 Chrome(Selenium 4 會自動管理 chromedriver)
 
 資料來源:
-  成分股權重  MoneyDJ ETF 持股頁(Selenium 抓取,各投信的 ETF 都適用)
+  成分股權重  元大投信 ETF 持股比重頁(Selenium 抓取,僅適用元大發行的 ETF,如 0050、0056)
   成交量/價格 證交所 STOCK_DAY(上市)、櫃買中心 tradingStock(上櫃)
   籌碼面      證交所 T86(上市)、櫃買中心 insti/dailyTrade(上櫃)三大法人買賣超
   股票名稱    證交所 / 櫃買中心 OpenAPI 公司基本資料
@@ -28,6 +28,7 @@ from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
+from selenium.common.exceptions import TimeoutException
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 
@@ -45,7 +46,7 @@ if not _st_running():
     sys.exit(0)
 
 HEADERS = {"User-Agent": "Mozilla/5.0"}
-MONEYDJ = "https://www.moneydj.com/etf/x/basic/basic0007b.xdjhtm?etfid={code}.tw"
+YUANTA = "https://www.yuantaetfs.com/product/detail/{code}/ratio"
 
 
 # ---------------------------------------------------------------- 1. 成分股
@@ -63,6 +64,7 @@ def make_driver():
     opts.add_argument("--disable-dev-shm-usage")  # 雲端 /dev/shm 很小,避免 Chrome 崩潰
     opts.add_argument("--disable-gpu")
     opts.add_argument("--window-size=1400,1000")
+    opts.set_capability("goog:loggingPrefs", {"performance": "ALL"})  # 攔截頁面的 XHR/API 回應
     browser = shutil.which("chromium") or shutil.which("chromium-browser")
     driver_bin = shutil.which("chromedriver")
     if browser and driver_bin:
@@ -71,40 +73,117 @@ def make_driver():
     return webdriver.Chrome(options=opts)
 
 
+def _btn_xpath(*kws: str) -> str:
+    """找「看更多 / 載入更多 / 展開 / 下一頁」這類短文字按鈕(排除會跳到別頁的一般連結)。"""
+    parts = []
+    for kw in kws:
+        short = f"string-length(normalize-space(.))<=8 and contains(normalize-space(.),'{kw}')"
+        parts.append(f"//button[{short}]")
+        parts.append(f"//a[{short}][not(@href) or starts-with(@href,'#') or starts-with(@href,'javascript')]")
+        parts.append(f"//*[self::div or self::span or self::li or self::p]"
+                     f"[not(*)][{short}]")  # [not(*)] = 最內層文字節點,避免點到整個容器
+    return "|".join(parts)
+
+
+def _click_first(driver, xpath: str) -> bool:
+    """點第一個可見的符合元素;點得到回傳 True。"""
+    try:
+        for el in driver.find_elements(By.XPATH, xpath):
+            if el.is_displayed() and el.is_enabled():
+                driver.execute_script("arguments[0].click();", el)
+                return True
+    except Exception:
+        pass
+    return False
+
+
+# 口袋證券持股頁是前端渲染(Nuxt),要等表格出現;「代號 名稱 權重 持有數 單位」
+_ROW_RE = re.compile(r"(?<![\w.])(\d{4,6}[A-Z]?)\s+(\S+?)\s+(\d+(?:\.\d+)?)\s*%")
+_CODE_RE = re.compile(r"^\d{4,6}[A-Z]?$")  # 排除 CASH / RP / MARGIN 等非股票列
+_TABLE_JS = ("return Array.from(document.querySelectorAll('table tr')).map("
+             "tr => Array.from(tr.querySelectorAll('th,td')).map(c => c.innerText.trim()));")
+_MORE_TEXTS = ("查看更多", "顯示更多", "載入更多", "更多", "展開全部", "展開",
+               "顯示全部", "查看全部", "全部顯示", "下一頁")
+
+
+def _more_xpath() -> str:
+    cond = " or ".join(f"normalize-space(.)='{t}'" for t in _MORE_TEXTS)
+    # <a> 只點不會換頁的(無 href、# 或 javascript),避免誤跳到別的頁面
+    return (f"//button[{cond}]|//span[{cond}]|//div[{cond}]|//li[{cond}]"
+            f"|//a[({cond}) and (not(@href) or starts-with(@href,'#') or starts-with(@href,'javascript'))]")
+
+
+def _extract_rows(driver) -> dict:
+    """從目前頁面抓出 {代號: {名稱, 權重}}。先讀 <table>,讀不到再用文字比對備援。"""
+    out = {}
+    try:
+        rows = driver.execute_script(_TABLE_JS) or []
+    except Exception:
+        rows = []
+    idx = None
+    for r in rows:
+        c_code = next((i for i, c in enumerate(r) if "代號" in c), None)
+        c_w = next((i for i, c in enumerate(r) if "權重" in c), None)
+        if c_code is not None and c_w is not None:  # 表頭列
+            c_name = next((i for i, c in enumerate(r) if "名稱" in c), None)
+            idx = (c_code, c_name, c_w)
+            continue
+        if not idx or len(r) <= max(i for i in idx if i is not None):
+            continue
+        code = r[idx[0]].strip().upper()
+        m = re.search(r"\d+(?:\.\d+)?", r[idx[2]].replace(",", ""))
+        if not _CODE_RE.match(code) or not m:
+            continue
+        name = r[idx[1]].strip() if idx[1] is not None else code
+        out.setdefault(code, {"代號": code, "名稱": name.replace("*", "").strip(),
+                              "權重(%)": float(m.group())})
+    if out:
+        return out
+    # 備援:表格不是 <table> 時,直接比對整頁文字
+    try:
+        text = driver.execute_script("return document.body.innerText;") or ""
+    except Exception:
+        text = ""
+    for code, name, w in _ROW_RE.findall(text):
+        if _CODE_RE.match(code):
+            out.setdefault(code, {"代號": code, "名稱": name.replace("*", "").strip(),
+                                  "權重(%)": float(w)})
+    return out
+
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_holdings(etf: str) -> pd.DataFrame:
+    """口袋證券 ETF 持股明細:捲到底、點「更多/下一頁」直到不再增加,確保拿到全部持股。"""
     driver = make_driver()
     try:
         # finally 裡的程式不管有沒有出錯都會執行,確保 Chrome 一定被關掉,不會留下殭屍程序。
-        driver.get(MONEYDJ.format(code=etf))
-        WebDriverWait(driver, 20).until(
-            EC.presence_of_element_located((By.TAG_NAME, "table"))
-        )
-        time.sleep(1.5)  # 等動態內容載入
-        tables = pd.read_html(StringIO(driver.page_source))
+        driver.get(POCKET.format(code=etf))
+        WebDriverWait(driver, 25).until(lambda d: bool(_extract_rows(d)))  # 等前端渲染出持股
+        seen = dict(_extract_rows(driver))
+        stale = 0
+        for _ in range(60):
+            driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+            time.sleep(0.8)
+            clicked = _click_first(driver, _more_xpath())
+            if clicked:
+                time.sleep(1.2)
+            new = _extract_rows(driver)
+            grew = any(k not in seen for k in new)
+            for k, v in new.items():
+                seen.setdefault(k, v)
+            if grew:
+                stale = 0
+            else:
+                stale += 1
+                if not clicked or stale >= 2:
+                    break
     finally:
         driver.quit()
 
-    # 找出含「比例」欄位的表格(頁面結構改版時,這裡是最可能要調整的地方)
-    for df in tables:
-        cols = [str(c) for c in df.columns]
-        w_col = next((c for c in cols if "比例" in c), None)
-        n_col = next((c for c in cols if "名稱" in c), None)
-        if w_col and n_col:
-            df.columns = cols
-            rows = []
-            for _, r in df.iterrows():
-                m = re.search(r"\((\w+)\.TW", str(r[n_col]))  # .TW 與 .TWO(上櫃)都會匹配
-                if not m:
-                    continue
-                rows.append({
-                    "代號": m.group(1),
-                    "名稱": re.sub(r"\(.*\)", "", str(r[n_col])).strip(),
-                    "權重(%)": pd.to_numeric(r[w_col], errors="coerce"),
-                })
-            out = pd.DataFrame(rows).dropna()
-            return out.sort_values("權重(%)", ascending=False).reset_index(drop=True)
-    return pd.DataFrame()
+    if not seen:
+        return pd.DataFrame()
+    out = pd.DataFrame(list(seen.values())).dropna()
+    return out.sort_values("權重(%)", ascending=False).reset_index(drop=True)
 
 
 @st.cache_data(ttl=86400, show_spinner=False)
@@ -528,7 +607,7 @@ with st.sidebar:
         st.caption("用手機或平板的相機掃描即可開啟。")
         if "127.0.0.1" in share_url or "localhost" in share_url:
             st.warning("目前是本機位址,手機打不開。請確認電腦已連上 Wi-Fi,或手動填入電腦的區網 IP。")
-    st.caption("本機執行時需與電腦連同一個 Wi-Fi(並檢查防火牆連接埠 8501);部署到 Streamlit Cloud 則任何網路都能開。")
+    st.caption("連線成功")
 
 # 觸控裝置友善:按鈕/頁籤加大、窄螢幕縮小邊距、表格可橫向捲動
 st.markdown("""
@@ -574,20 +653,28 @@ if len(codes) > 1:
 # 00 開頭視為 ETF,其餘視為個股
 is_etf = code.startswith("00")
 if is_etf:
-    with st.spinner(f"Selenium 抓取 {code} 成分股…"):
+    with st.spinner(f"Selenium 從元大投信抓取 {code} 成分股…"):
         try:
             holdings = fetch_holdings(code)
         except Exception as e:
             holdings = pd.DataFrame()
             st.error(f"抓取失敗:{e}")
     if holdings.empty:
-        st.error("找不到成分股。請確認代碼,或來源頁面結構已改版,需調整 fetch_holdings。")
+        st.error("找不到成分股。此來源只支援元大投信發行的 ETF(如 0050、0056),"
+             "其他投信的 ETF 請改用其他來源;若確定是元大 ETF,可能是頁面結構改版,需調整 fetch_holdings。")
         st.stop()
     st.subheader(f"{code} 成分股(共 {len(holdings)} 檔台股)")
     st.caption("前五大:" + "、".join(
         f"{r['名稱']} ({r['代號']}):{r['權重(%)']:.2f}%"
-        for _, r in holdings.head(5).iterrows()))
-    st.dataframe(holdings, use_container_width=True, hide_index=True)
+        for _, r in holdings.head(5).iterrows())
+        + f"｜台股權重合計 {holdings['權重(%)'].sum():.2f}%(其餘可能為現金、期貨或海外標的)")
+    show = holdings.assign(排名=range(1, len(holdings) + 1))[["排名", "代號", "名稱", "權重(%)"]]
+    st.dataframe(
+        show, use_container_width=True, hide_index=True,
+        height=min(38 + 35 * len(show), 2000),  # 依筆數撐高,不用捲動就能看到全部
+        column_config={"權重(%)": st.column_config.ProgressColumn(
+            "權重(%)", format="%.2f%%", min_value=0.0,
+            max_value=float(holdings["權重(%)"].max()))})
 else:
     # 個股:成分股就是它自己,權重 100%
     name_map = fetch_name_map()
@@ -602,7 +689,10 @@ else:
 c1, c2, c3 = st.columns([1, 2, 1])
 picked = c1.date_input("選擇日期", value=date.today(), max_value=date.today())
 views = c2.multiselect("選擇要看的面向(可複選)", ASPECTS, default=[])
-top_n = c3.slider("前 N 大持股", 3, 30, 10) if is_etf else 1
+if is_etf and len(holdings) > 3:
+    top_n = c3.slider("分析前 N 大持股(越多越慢)", 3, len(holdings), min(10, len(holdings)))
+else:
+    top_n = len(holdings)
 
 if not views:
     st.info("請在上方選擇要看的面向:成交量、技術面、籌碼面。")
@@ -657,4 +747,4 @@ for tab, v in zip(tabs, views):
             else:
                 st.line_chart(d["close"])
 
-st.caption("僅供研究參考,不構成投資建議。資料以證交所、櫃買中心與 MoneyDJ 公開資訊為準。")
+st.caption("僅供研究參考,不構成投資建議。資料以證交所、櫃買中心與元大投信公開資訊為準。")
