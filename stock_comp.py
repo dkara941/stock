@@ -653,7 +653,7 @@ if len(codes) > 1:
 # 00 開頭視為 ETF,其餘視為個股
 is_etf = code.startswith("00")
 if is_etf:
-    with st.spinner(f"Selenium 從口袋證券抓取 {code} 成分股…"):
+    with st.spinner(f"Selenium 讀取中 {code} 成分股…"):
         try:
             holdings = fetch_holdings(code)
         except Exception as e:
